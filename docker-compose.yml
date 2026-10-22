@@ -1,0 +1,29 @@
+services:
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: inventory_service
+      POSTGRES_USER: oficina
+      POSTGRES_PASSWORD: oficina-local
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U oficina -d inventory_service"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    volumes:
+      - inventory_data:/var/lib/postgresql/data
+  inventory-service:
+    build: .
+    command: ["sh", "-c", "alembic upgrade head && uvicorn app.main:app --host 0.0.0.0 --port 8000"]
+    ports:
+      - "8003:8000"
+    environment:
+      DATABASE_URL: postgresql+psycopg://oficina:oficina-local@db:5432/inventory_service
+      INTERNAL_SERVICE_TOKEN: ${INTERNAL_SERVICE_TOKEN:-local-only-change-me}
+      JWT_SECRET_KEY: ${JWT_SECRET_KEY:-local-only-change-me}
+      JWT_ALGORITHM: HS256
+    depends_on:
+      db:
+        condition: service_healthy
+volumes:
+  inventory_data:

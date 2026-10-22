@@ -1,0 +1,6 @@
+environment               = "homologacao"
+aws_region                = "us-east-1"
+vpc_id                    = "vpc-00000000000000000"
+private_subnet_ids        = ["subnet-00000000000000000", "subnet-11111111111111111"]
+eks_cluster_security_group_id = "sg-00000000000000000"
+db_password               = "replace-with-a-secret"

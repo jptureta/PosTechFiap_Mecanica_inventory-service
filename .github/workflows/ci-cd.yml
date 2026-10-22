@@ -1,0 +1,69 @@
+name: Inventory service CI/CD
+
+on:
+  pull_request:
+    branches: [main, homologacao, production]
+  push:
+    branches: [homologacao, production]
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: astral-sh/setup-uv@v5
+      - run: uv sync --dev
+      - run: uv run pytest -q
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.8.5
+      - run: terraform fmt -check -recursive
+        working-directory: infra
+      - run: terraform init -backend=false
+        working-directory: infra
+      - run: terraform validate
+        working-directory: infra
+
+  deploy:
+    if: github.event_name == 'push'
+    needs: test
+    runs-on: ubuntu-latest
+    environment: ${{ github.ref_name }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: |
+            ghcr.io/${{ github.repository_owner }}/oficina-inventory-service:${{ github.sha }}
+            ghcr.io/${{ github.repository_owner }}/oficina-inventory-service:latest
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-session-token: ${{ secrets.AWS_SESSION_TOKEN }}
+          aws-region: ${{ secrets.AWS_REGION }}
+      - uses: azure/setup-kubectl@v4
+      - run: aws eks update-kubeconfig --name oficina-mecanica-eks --region "${{ secrets.AWS_REGION }}"
+      - run: |
+          kubectl create namespace oficina --dry-run=client -o yaml | kubectl apply -f -
+          kubectl delete job inventory-service-migration -n oficina --ignore-not-found
+          sed "s|:latest|:${{ github.sha }}|g" k8s/migration-job.yaml | kubectl apply -f -
+          kubectl wait --for=condition=complete job/inventory-service-migration -n oficina --timeout=180s
+          kubectl apply -f k8s/deployment.yaml
+          kubectl -n oficina set image deployment/inventory-service inventory-service=ghcr.io/${{ github.repository_owner }}/oficina-inventory-service:${{ github.sha }}
+          kubectl -n oficina rollout status deployment/inventory-service --timeout=180s
