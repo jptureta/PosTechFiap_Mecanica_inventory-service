@@ -1,5 +1,7 @@
 import os
 import logging
+import threading
+from contextlib import asynccontextmanager
 from decimal import Decimal
 from typing import Annotated
 
@@ -9,11 +11,14 @@ from sqlalchemy import Boolean, CheckConstraint, JSON, Integer, Numeric, String,
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column, sessionmaker
 
+from app import messaging, observability
 from app.auth import Actor, get_actor
 
 logger = logging.getLogger(__name__)
 DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./inventory-service.db")
 INTERNAL_TOKEN = os.getenv("INTERNAL_SERVICE_TOKEN", "")
+OS_EVENTS_QUEUE_URL = os.getenv("OS_EVENTS_QUEUE_URL", "")
+INVENTORY_COMMANDS_QUEUE_URL = os.getenv("INVENTORY_COMMANDS_QUEUE_URL", "")
 engine_options = {"connect_args": {"check_same_thread": False}} if DATABASE_URL.startswith("sqlite") else {}
 engine = create_engine(DATABASE_URL, **engine_options)
 SessionLocal = sessionmaker(bind=engine, expire_on_commit=False)
@@ -98,7 +103,66 @@ def require_admin_actor(actor: Actor = Depends(get_actor)) -> Actor:
     return actor
 
 
-app = FastAPI(title="Estoque e Catálogo", version="1.0.0")
+def emit_os_event(event_type: str, payload: dict, order_id: str, dedup_id: str | None = None) -> None:
+    if messaging.MESSAGING_ENABLED and OS_EVENTS_QUEUE_URL:
+        messaging.publish(OS_EVENTS_QUEUE_URL, event_type, payload, group_id=order_id, dedup_id=dedup_id)
+
+
+def handle_inventory_command(db: Session, command_type: str, payload: dict) -> None:
+    if command_type == "ReserveStock":
+        cmd = ReserveItems.model_validate(payload)
+        if not cmd.items:
+            emit_os_event(
+                "StockReserved",
+                {"order_id": cmd.order_id, "items": []},
+                order_id=cmd.order_id,
+                dedup_id=f"stock-reserved-{cmd.order_id}",
+            )
+            return
+        try:
+            res = reserve(cmd, db, None)
+            emit_os_event(
+                "StockReserved",
+                {"order_id": cmd.order_id, "items": res["items"]},
+                order_id=cmd.order_id,
+                dedup_id=f"stock-reserved-{cmd.order_id}",
+            )
+        except HTTPException as exc:
+            emit_os_event(
+                "StockReservationFailed",
+                {"order_id": cmd.order_id, "reason": str(exc.detail)},
+                order_id=cmd.order_id,
+                dedup_id=f"stock-failed-{cmd.order_id}",
+            )
+    elif command_type == "ReleaseStock":
+        order_id = payload.get("order_id", "")
+        if order_id:
+            release(order_id, db, None)
+            emit_os_event(
+                "StockReleased",
+                {"order_id": order_id},
+                order_id=order_id,
+                dedup_id=f"stock-released-{order_id}",
+            )
+
+
+def consume_inventory_command(command_type: str, payload: dict) -> None:
+    with SessionLocal() as session:
+        handle_inventory_command(session, command_type, payload)
+
+
+@asynccontextmanager
+async def lifespan(_: FastAPI):
+    stops: list[threading.Event] = []
+    if messaging.MESSAGING_ENABLED and INVENTORY_COMMANDS_QUEUE_URL:
+        stops.append(messaging.start_consumer(INVENTORY_COMMANDS_QUEUE_URL, consume_inventory_command))
+    yield
+    for stop in stops:
+        stop.set()
+
+
+app = FastAPI(title="Estoque e Catálogo", version="1.0.0", lifespan=lifespan)
+observability.instrument_app(app, "inventory-service")
 
 
 @app.get("/health")
