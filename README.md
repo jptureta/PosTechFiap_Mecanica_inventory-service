@@ -22,6 +22,14 @@ leituras de catálogo autenticadas.
 O namespace também precisa do secret `ghcr-pull` para leitura de imagens privadas
 no GHCR.
 
+Com `MESSAGING_ENABLED=true`, o serviço consome `ReserveStock` e `ReleaseStock`
+da fila durável `oficina.inventory.commands` e publica `StockReserved`,
+`StockReservationFailed` ou `StockReleased` em `oficina.os.events`. Configure
+`RABBITMQ_URL`; em Kubernetes, o deployment usa o secret
+`microservices-secrets`, chave `rabbitmq-url`. O serviço acessa somente seu
+próprio PostgreSQL; o OS consulta o catálogo pela API HTTP e nunca acessa o banco
+do Inventory.
+
 O RDS exclusivo é definido em `infra/`. Valide com
 `terraform -chdir=infra init -backend=false`, `terraform -chdir=infra validate`
 e `terraform -chdir=infra plan` após fornecer as variáveis requeridas. O apply

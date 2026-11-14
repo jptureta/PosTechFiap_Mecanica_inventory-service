@@ -1,4 +1,19 @@
 services:
+  rabbitmq:
+    image: rabbitmq:3.13-management-alpine
+    environment:
+      RABBITMQ_DEFAULT_USER: oficina
+      RABBITMQ_DEFAULT_PASS: oficina-local-only
+    volumes:
+      - rabbitmq_data:/var/lib/rabbitmq
+    ports:
+      - "5672:5672"
+      - "15672:15672"
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
   db:
     image: postgres:16-alpine
     environment:
@@ -19,11 +34,16 @@ services:
       - "8003:8000"
     environment:
       DATABASE_URL: postgresql+psycopg://oficina:oficina-local@db:5432/inventory_service
+      MESSAGING_ENABLED: ${MESSAGING_ENABLED:-true}
+      RABBITMQ_URL: amqp://oficina:oficina-local-only@rabbitmq:5672/%2F
       INTERNAL_SERVICE_TOKEN: ${INTERNAL_SERVICE_TOKEN:-local-only-change-me}
       JWT_SECRET_KEY: ${JWT_SECRET_KEY:-local-only-change-me}
       JWT_ALGORITHM: HS256
     depends_on:
       db:
         condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
 volumes:
   inventory_data:
+  rabbitmq_data:

@@ -1,5 +1,6 @@
 import os
 import logging
+from contextlib import asynccontextmanager
 from decimal import Decimal
 from typing import Annotated
 
@@ -9,6 +10,7 @@ from sqlalchemy import Boolean, CheckConstraint, JSON, Integer, Numeric, String,
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column, sessionmaker
 
+from app import messaging
 from app.auth import Actor, get_actor
 
 logger = logging.getLogger(__name__)
@@ -98,7 +100,17 @@ def require_admin_actor(actor: Actor = Depends(get_actor)) -> Actor:
     return actor
 
 
-app = FastAPI(title="Estoque e Catálogo", version="1.0.0")
+@asynccontextmanager
+async def lifespan(_: FastAPI):
+    stop = None
+    if messaging.MESSAGING_ENABLED:
+        stop = messaging.start_consumer(messaging.INVENTORY_COMMANDS_QUEUE, handle_inventory_command)
+    yield
+    if stop is not None:
+        stop.set()
+
+
+app = FastAPI(title="Estoque e Catálogo", version="1.0.0", lifespan=lifespan)
 
 
 @app.get("/health")
@@ -273,3 +285,32 @@ def release(
         db.rollback()
         raise
     return {"order_id": order_id, "status": "RELEASED"}
+
+
+def handle_inventory_command(message_type: str, payload: dict) -> None:
+    with SessionLocal() as db:
+        if message_type == "ReserveStock":
+            try:
+                result = reserve(ReserveItems.model_validate(payload), db, None)
+            except HTTPException as exc:
+                messaging.publish(
+                    messaging.OS_EVENTS_QUEUE,
+                    "StockReservationFailed",
+                    {"order_id": payload["order_id"], "reason": str(exc.detail)},
+                )
+                return
+            messaging.publish(
+                messaging.OS_EVENTS_QUEUE,
+                "StockReserved",
+                {"order_id": result["order_id"], "items": result["items"]},
+            )
+            return
+        if message_type == "ReleaseStock":
+            result = release(payload["order_id"], db, None)
+            messaging.publish(
+                messaging.OS_EVENTS_QUEUE,
+                "StockReleased",
+                {"order_id": result["order_id"]},
+            )
+            return
+        raise ValueError(f"unsupported inventory command: {message_type}")
