@@ -5,7 +5,7 @@ Possui PostgreSQL exclusivo; OS consome somente a API HTTP e nunca acessa esse
 banco diretamente.
 
 Execute `docker compose up --build` e acesse `http://localhost:8003/docs`.
-Testes: `uv sync --dev && uv run pytest`.
+Testes e qualidade: `uv sync --dev && uv run pytest --cov=app --cov-report=term-missing --cov-fail-under=80 -q && uv run ruff check --select E4,E7,E9,F app tests`.
 Para execução local fora do Docker, rode `alembic upgrade head` antes de iniciar
 o servidor.
 
