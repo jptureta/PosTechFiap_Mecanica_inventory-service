@@ -24,8 +24,9 @@ jobs:
       - run: uv sync --dev
       - run: uv run pytest --cov=app --cov-report=xml --cov-report=term-missing --cov-fail-under=80 -q
       - run: uv run ruff check --select E4,E7,E9,F app tests
+      # Obrigatório: sem SONAR_TOKEN o job falha. sonar.qualitygate.wait=true
+      # faz o Quality Gate reprovado bloquear o PR.
       - name: SonarCloud Scan
-        if: env.SONAR_TOKEN != ''
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}

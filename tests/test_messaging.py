@@ -72,13 +72,17 @@ class FakeChannel:
 def test_publish_and_process_batch_acknowledges_message(monkeypatch):
     broker = FakeRabbit()
     monkeypatch.setattr(messaging, "_connection", broker.connection)
-    message_id = messaging.publish("inventory.commands", "ReserveStock", {"order_id": "order-1"})
+    message_id = messaging.publish(
+        "inventory.commands", "ReserveStock", {"order_id": "order-1"}, correlation_id="corr-from-os"
+    )
     envelope = json.loads(broker.queues["inventory.commands"][0])
 
+    assert message_id
+    # O ID de rastreio recebido é repassado, não recriado a cada mensagem.
     assert envelope == {
         "type": "ReserveStock",
         "payload": {"order_id": "order-1"},
-        "correlation_id": message_id,
+        "correlation_id": "corr-from-os",
     }
     received = []
     assert messaging.process_batch(
@@ -122,3 +126,30 @@ def test_start_consumer_stops_after_empty_batch(monkeypatch):
         assert processed.wait(timeout=2)
     finally:
         stop.set()
+
+
+def test_consumed_correlation_id_is_reused_when_publishing(monkeypatch):
+    broker = FakeRabbit()
+    monkeypatch.setattr(messaging, "_connection", broker.connection)
+    messaging.publish("inventory.commands", "ReserveStock", {"order_id": "o"}, correlation_id="corr-saga-1")
+
+    def handler(*_):
+        messaging.publish(messaging.OS_EVENTS_QUEUE, "StockReserved", {"order_id": "o"})
+
+    assert messaging.process_batch("inventory.commands", handler) == 1
+    event = json.loads(broker.queues[messaging.OS_EVENTS_QUEUE][0])
+    assert event["correlation_id"] == "corr-saga-1"
+
+
+def test_queue_declares_dead_letter_exchange():
+    declared = {}
+
+    class Channel:
+        def queue_declare(self, queue, durable, arguments=None):
+            declared[queue] = arguments
+
+    messaging._declare_queue(Channel(), "inventory.commands")
+    assert declared["inventory.commands"] == {
+        "x-dead-letter-exchange": "",
+        "x-dead-letter-routing-key": "inventory.commands.dlq",
+    }

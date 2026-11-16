@@ -4,18 +4,20 @@ from contextlib import asynccontextmanager
 from decimal import Decimal
 from typing import Annotated
 
-from fastapi import Depends, FastAPI, Header, HTTPException, status
+from fastapi import Depends, FastAPI, Header, HTTPException, Query, status
 from pydantic import BaseModel, Field
 from sqlalchemy import Boolean, CheckConstraint, JSON, Integer, Numeric, String, create_engine, select, text
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column, sessionmaker
 
-from app import messaging
+from app import messaging, observability
 from app.auth import Actor, get_actor
 
-logger = logging.getLogger(__name__)
+logger = logging.getLogger("inventory-service")
 DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./inventory-service.db")
 INTERNAL_TOKEN = os.getenv("INTERNAL_SERVICE_TOKEN", "")
+# Abaixo deste saldo a peça entra no alerta de estoque baixo (log + métrica + GET /parts?low_stock=true).
+LOW_STOCK_THRESHOLD = int(os.getenv("LOW_STOCK_THRESHOLD", "5"))
 engine_options = {"connect_args": {"check_same_thread": False}} if DATABASE_URL.startswith("sqlite") else {}
 engine = create_engine(DATABASE_URL, **engine_options)
 SessionLocal = sessionmaker(bind=engine, expire_on_commit=False)
@@ -110,7 +112,21 @@ async def lifespan(_: FastAPI):
         stop.set()
 
 
-app = FastAPI(title="Estoque e Catálogo", version="1.0.0", lifespan=lifespan)
+app = FastAPI(title="Estoque e Catálogo", version="1.1.0", lifespan=lifespan)
+observability.instrument_app(app, "inventory-service")
+
+
+def count(metric: str, key: str) -> None:
+    observability.METRICS.setdefault(metric, {})
+    observability.METRICS[metric][key] = observability.METRICS[metric].get(key, 0) + 1
+
+
+def warn_low_stock(part: "Part") -> None:
+    if part.available_stock <= LOW_STOCK_THRESHOLD:
+        count("low_stock_alerts", part.sku)
+        logger.warning(
+            "low_stock sku=%s available=%s threshold=%s", part.sku, part.available_stock, LOW_STOCK_THRESHOLD
+        )
 
 
 @app.get("/health")
@@ -126,6 +142,26 @@ def health(db: Session = Depends(get_db)):
 @app.get("/health/live")
 def liveness():
     return {"status": "ok", "service": "inventory-service"}
+
+
+@app.get("/parts", response_model=list[CatalogItemResponse])
+def list_parts(
+    low_stock: Annotated[bool, Query(description="Somente peças com saldo no limite de alerta")] = False,
+    _: Actor = Depends(require_admin_actor),
+    db: Session = Depends(get_db),
+):
+    query = select(Part).order_by(Part.sku)
+    if low_stock:
+        query = query.where(Part.active.is_(True), Part.available_stock <= LOW_STOCK_THRESHOLD)
+    return list(db.scalars(query))
+
+
+@app.get("/reservations/{order_id}")
+def get_reservation(order_id: str, _: Actor = Depends(require_admin_actor), db: Session = Depends(get_db)):
+    reservation = db.get(Reservation, order_id)
+    if reservation is None:
+        raise HTTPException(status_code=404, detail="reservation not found")
+    return {"order_id": reservation.order_id, "items": reservation.items, "status": "RESERVED"}
 
 
 @app.get("/parts/{sku}", response_model=CatalogItemResponse)
@@ -254,9 +290,14 @@ def reserve(
             parts[item["sku"]].available_stock -= item["quantity"]
         db.add(Reservation(order_id=payload.order_id, items=requested))
         db.commit()
-    except HTTPException:
+    except HTTPException as exc:
         db.rollback()
+        count("stock_reservations", "failed")
+        logger.info("stock reservation failed for order %s: %s", payload.order_id, exc.detail)
         raise
+    count("stock_reservations", "reserved")
+    for part in parts.values():
+        warn_low_stock(part)
     return {"order_id": payload.order_id, "items": requested, "status": "RESERVED"}
 
 
@@ -284,6 +325,8 @@ def release(
     except HTTPException:
         db.rollback()
         raise
+    count("stock_reservations", "released")
+    logger.info("stock released for order %s (saga compensation)", order_id)
     return {"order_id": order_id, "status": "RELEASED"}
 
 
