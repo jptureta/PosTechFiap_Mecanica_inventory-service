@@ -9,11 +9,13 @@ from uuid import uuid4
 
 import pika
 
+from app import observability
+
 logger = logging.getLogger(__name__)
 MESSAGING_ENABLED = os.getenv("MESSAGING_ENABLED", "false").lower() == "true"
 RABBITMQ_URL = os.getenv("RABBITMQ_URL", "")
-INVENTORY_COMMANDS_QUEUE = os.getenv("INVENTORY_COMMANDS_QUEUE", "oficina.inventory.commands")
 OS_EVENTS_QUEUE = os.getenv("OS_EVENTS_QUEUE", "oficina.os.events")
+INVENTORY_COMMANDS_QUEUE = os.getenv("INVENTORY_COMMANDS_QUEUE", "oficina.inventory.commands")
 
 
 def _connection() -> pika.BlockingConnection:
@@ -28,14 +30,21 @@ def _declare_queue(channel: pika.adapters.blocking_connection.BlockingChannel, q
     channel.queue_declare(
         queue=queue_name,
         durable=True,
-        arguments={"x-dead-letter-routing-key": dead_letter_queue},
+        # Sem x-dead-letter-exchange o RabbitMQ descarta a mensagem rejeitada.
+        # "" = exchange padrão, que entrega direto na fila com o nome da routing key.
+        arguments={"x-dead-letter-exchange": "", "x-dead-letter-routing-key": dead_letter_queue},
     )
 
 
-def publish(queue_name: str, message_type: str, payload: dict) -> str:
-    message_id = str(uuid4())
+def publish(
+    queue_name: str,
+    message_type: str,
+    payload: dict,
+    correlation_id: str | None = None,
+) -> str:
+    cid = correlation_id or observability.get_correlation_id()
     body = json.dumps(
-        {"type": message_type, "payload": payload, "correlation_id": message_id},
+        {"type": message_type, "payload": payload, "correlation_id": cid},
         default=str,
     )
     connection = _connection()
@@ -43,6 +52,7 @@ def publish(queue_name: str, message_type: str, payload: dict) -> str:
         channel = connection.channel()
         _declare_queue(channel, queue_name)
         channel.confirm_delivery()
+        message_id = str(uuid4())
         confirmed = channel.basic_publish(
             exchange="",
             routing_key=queue_name,
@@ -51,7 +61,7 @@ def publish(queue_name: str, message_type: str, payload: dict) -> str:
                 content_type="application/json",
                 delivery_mode=2,
                 message_id=message_id,
-                correlation_id=message_id,
+                correlation_id=cid,
             ),
             mandatory=True,
         )
@@ -60,6 +70,7 @@ def publish(queue_name: str, message_type: str, payload: dict) -> str:
     finally:
         if connection.is_open:
             connection.close()
+    observability.METRICS["events_published"][message_type] += 1
     return message_id
 
 
@@ -80,12 +91,14 @@ def process_batch(queue_name: str, handler: Callable[[str, dict], None], max_mes
                 payload = envelope["payload"]
                 if not isinstance(payload, dict):
                     raise ValueError("message payload must be an object")
+                observability.set_correlation_id(envelope.get("correlation_id"))
                 handler(message_type, payload)
             except Exception:
                 logger.exception("failed to process RabbitMQ message from %s", queue_name)
                 channel.basic_nack(delivery_tag=method.delivery_tag, requeue=False)
                 continue
             channel.basic_ack(delivery_tag=method.delivery_tag)
+            observability.METRICS["events_consumed"][message_type] += 1
             processed += 1
     finally:
         if connection.is_open:
@@ -105,5 +118,9 @@ def start_consumer(queue_name: str, handler: Callable[[str, dict], None]) -> thr
                 logger.exception("consumer loop error for %s", queue_name)
                 stop.wait(5)
 
-    threading.Thread(target=loop, name=f"consumer-{queue_name.rsplit('.', 1)[-1]}", daemon=True).start()
+    threading.Thread(
+        target=loop,
+        name=f"consumer-{queue_name.rsplit('.', 1)[-1]}",
+        daemon=True,
+    ).start()
     return stop

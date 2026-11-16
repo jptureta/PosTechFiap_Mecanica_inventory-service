@@ -45,6 +45,8 @@ spec:
                 secretKeyRef:
                   name: microservices-secrets
                   key: rabbitmq-url
+            - name: LOW_STOCK_THRESHOLD
+              value: "5"
           readinessProbe:
             httpGet:
               path: /health
@@ -53,7 +55,7 @@ spec:
             httpGet:
               path: /health/live
               port: 8000
-              initialDelaySeconds: 10
+            initialDelaySeconds: 10
           securityContext:
             allowPrivilegeEscalation: false
             runAsNonRoot: true
